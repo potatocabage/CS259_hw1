@@ -54,12 +54,13 @@ __device__ void load_neuron_i_tile(
 __device__ void load_synapse_xy_from_global(
     half* synapse_reg_buf,     // FIX: was float*
     half* synapse_global,      // FIX: was float*
-    int k_row, int k_col, int t_idx, int blockDim_x, 
+    int k_row, int k_col, int Nn_idx, int t_idx, int blockDim_x, 
     int Ni, int Nn, int kx_dim, int ky_dim
 )
 {
-    int elements_per_thread = (Nn * Ni) / blockDim_x;  // FIX: was Nn_over_2 = (Nn+1)/2
-    int base = (k_row * kx_dim * Nn * Ni) + (k_col * Nn * Ni);
+    // Should only handle 16 output channels at a time
+    int elements_per_thread = (16 * Ni) / blockDim_x;  // FIX: was Nn_over_2 = (Nn+1)/2
+    int base = (k_row * kx_dim * 16 * Ni) + (k_col * 16 * Ni) + (Nn_idx * 16 * Ni) ;
     for (int k = 0; k < elements_per_thread; k++){
         int global_flat = base + k * blockDim_x + t_idx;
         synapse_reg_buf[k] = synapse_global[global_flat];  // FIX: index k, not k*blockDim_x+t_idx
@@ -73,32 +74,14 @@ __device__ void load_synapse_xy_from_local(
     int Ni, int Nn, int kx_dim, int ky_dim
 )
 {
-    int elements_per_thread = (Nn * Ni) / blockDim_x;  // FIX: was Nn_over_2
+    // Should only handle 16 output channels at a time
+    int elements_per_thread = (16 * Ni) / blockDim_x;  // FIX: was Nn_over_2
     for (int k = 0; k < elements_per_thread; k++){
         int smem_flat = k * blockDim_x + t_idx;
         synapse_smem[smem_flat] = synapse_reg_buf[k];  // FIX: read [k], write interleaved
     }
 }
 
-
-__device__ void load_synapse_row_tile(
-    half* synapse_row_smem,    // FIX: was float*
-    half* synapse_global,      // FIX: was float*
-    int k_row, int t_idx, int blockDim_x, 
-    int Ni, int Nn, int kx_dim
-)
-{
-    int elements_per_thread = (Nn * Ni) / blockDim_x;  // FIX: was Nn_over_2
-    for (int j = 0; j < kx_dim; j++){
-        int base = (k_row * kx_dim * Nn * Ni) + (j * Nn * Ni);
-        for (int k = 0; k < elements_per_thread; k++){
-            int smem_flat = (j * Nn * Ni) + (k * blockDim_x) + t_idx;
-            int global_flat = base + (k * blockDim_x) + t_idx;
-            synapse_row_smem[smem_flat] = synapse_global[global_flat];
-        }
-    }
-    __syncthreads();
-}
 
 /* ------------------------------------------------------------------ */
 /* CUDA kernel for convolution                                        */
@@ -109,100 +92,134 @@ __global__ void convolution_kernel(
     float *neuron_n,   /* [B * NYSCL * NXSCL * Nn]    */
     int B, int NYPAD, int NXPAD, int NYSCL, int NXSCL, int Ni, int Nn, int ky_dim, int kx_dim)
 {
-    // TODO: Calculate thread indices and compute convolution
     // Grid Dim is (B, NYSCL / 8, NXSCL / 16)
-    // Block Dim is (128, 1, 1)
+    // Block Dim is (256, 1, 1)
     // each block does a 1x8x16x64 tile in output
     // each warp does a 1x1x16x64 tile in output
-    int t_idx = threadIdx.x; //0 to 127
+    int t_idx = threadIdx.x; //0 to 255
+    int warp_idx = t_idx / 32; // 0 to 7
+    
     int batch_idx = blockIdx.x;
     int y_out = blockIdx.y * 8;
     int x_out = blockIdx.z * 16;
     
     int pad_y = (ky_dim - 1) / 2;
     int pad_x = (kx_dim - 1) / 2;
+
+    int neuron_i_smem_y_dim = 8 + ky_dim - 1;
+    int neuron_i_smem_x_dim = 16 + kx_dim - 1;
     
-    __shared__ half neuron_i_smem[1 * 10 * 18 * 64];
-    __shared__ half synapse_smem_buf1[1 * 64 * 64];
-    __shared__ half synapse_smem_buf2[1 * 64 * 64];
-    half synapse_reg_buf[32];  // FIX: was 64*64; each thread only loads Nn*Ni/blockDim.x = 32
+    __shared__ half neuron_i_smem[1 * neuron_i_smem_y_dim * neuron_i_smem_x_dim * Ni];
+    __shared__ half synapse_smem_buf1[1 * 16 * Ni];
+    __shared__ half synapse_smem_buf2[1 * 16 * Ni];
+    half synapse_reg_buf[1 * 16 * Ni / blockDim.x];  // each thread only loads Nn*Ni/blockDim.x 
+
+    int padded_Nn = Nn + 4;
+    __shared__ float epilogue_smem[8 * 16 * padded_Nn];
     
     // FIX: was __shared__ with & — __shared__ vars can't have initializers, & gives wrong type
     half *active_synapse_smem_buf = synapse_smem_buf1;
     half *idle_synapse_smem_buf = synapse_smem_buf2;
     int active_buf_idx = 0;
     
-    // load neuron_i tile (1x10x18x64) into smem
+    // load neuron_i tile (1x10x18xNi) into smem
     load_neuron_i_tile(neuron_i_smem, neuron_i, t_idx, batch_idx, y_out, x_out, Ni, blockDim.x, NYPAD, NXPAD);
     
-    // load synapse[0,0] (1x1x64x64) into regs, then copy to smem with correct layout
-    load_synapse_xy_from_global(synapse_reg_buf, synapse, 0, 0, t_idx, blockDim.x, Ni, Nn, kx_dim, ky_dim);
-    load_synapse_xy_from_local(active_synapse_smem_buf, synapse_reg_buf, 0, 0, t_idx, blockDim.x, Ni, Nn, kx_dim, ky_dim);
-    __syncthreads();
+    
 
     // make wmma fragments
     wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> toeplitz_frag;   // FIX: was wmmma
-    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> filter_frag;     // FIX: was wmmma
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> filter_frag;     // FIX: was wmmma
     wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag;                       // FIX: was wmmma
-    wmma::fill_fragment(c_frag, 0.0f);
 
-    for (int k_row = 0; k_row < ky_dim; k_row ++){  // FIX: was hardcoded 3
-        for (int k_col = 0; k_col < kx_dim ; k_col ++){
-            int next_k_row = k_row;
-            int next_k_col = k_col + 1;
-            if (next_k_col >= kx_dim){
-                next_k_row = k_row + 1;
-                next_k_col = 0;
-            }
-            bool has_next = (next_k_row < ky_dim);
-
-            if (has_next){
-                load_synapse_xy_from_global(synapse_reg_buf, synapse, next_k_row, next_k_col, t_idx, blockDim.x, Ni, Nn, kx_dim, ky_dim);  // FIX: was load_synapse_xy (undefined)
-            }
-            active_synapse_smem_buf = (active_buf_idx == 0) ? synapse_smem_buf1 : synapse_smem_buf2;
-            
-            for (int i = 0; i < Nn / 16; i ++){
-                for(int j = 0; j < Ni / 16; j++){
-
-                    // load toeplitz from smem into registers
-                    int k_off_y = k_row - ky_dim / 2;
-                    int k_off_x = k_col - kx_dim / 2;
-                    
-                    // DESIGN TODO: toeplitz_idx uses global coords (NXPAD) but indexes into smem tile.
-                    // You need tile-local coordinates here.
-                    int toeplitz_idx = ((y_out + pad_y + k_off_y) * NXPAD * Ni) + ((x_out + pad_x + k_off_x) * Ni); //TODO: Padding
-                    wmma::load_matrix_sync(toeplitz_frag, neuron_i_smem + toeplitz_idx, Ni);  // FIX: was &neuron_i_smem
-
-                    // load filter from smem into registers
-                    // FIX: removed k_col * Nn * Ni — each smem buf is one [k_row][k_col] slice, no k_col dimension
-                    int filter_idx = (i * 16 * Ni) + (j * 16);
-                    wmma::load_matrix_sync(filter_frag, active_synapse_smem_buf + filter_idx, Ni);  // FIX: was active_synapse_row_smem_buf
-
-                    // dispatch wmma
-                    wmma::mma_sync(c_frag, toeplitz_frag, filter_frag, c_frag);
+    for (int i = 0; i < Nn / 16; i ++){
+        // load synapse[0,0] (1x1x16xNi) into regs, then copy to smem with correct layout
+        load_synapse_xy_from_global(synapse_reg_buf, synapse, 0, 0, i, t_idx, blockDim.x, Ni, Nn, kx_dim, ky_dim);
+        load_synapse_xy_from_local(active_synapse_smem_buf, synapse_reg_buf, 0, 0, t_idx, blockDim.x, Ni, Nn, kx_dim, ky_dim);
+        __syncthreads();
+        
+        wmma::fill_fragment(c_frag, 0.0f);
+        for (int k_row = 0; k_row < ky_dim; k_row ++){  // FIX: was hardcoded 3
+            for (int k_col = 0; k_col < kx_dim ; k_col ++){
+                int next_k_row = k_row;
+                int next_k_col = k_col + 1;
+                if (next_k_col >= kx_dim){
+                    next_k_row = k_row + 1;
+                    next_k_col = 0;
                 }
+                bool has_next = (next_k_row < ky_dim);
+
+                if (has_next){
+                    load_synapse_xy_from_global(synapse_reg_buf, synapse, next_k_row, next_k_col, i, t_idx, blockDim.x, Ni, Nn, kx_dim, ky_dim);  // FIX: was load_synapse_xy (undefined)
+                }
+                active_synapse_smem_buf = (active_buf_idx == 0) ? synapse_smem_buf1 : synapse_smem_buf2;
+                
+                
+                    for(int j = 0; j < Ni / 16; j++){
+
+                        // load toeplitz from smem into registers
+                        int k_off_y = k_row - ky_dim / 2;
+                        int k_off_x = k_col - kx_dim / 2;
+                        
+                        // DESIGN TODO: toeplitz_idx uses global coords (NXPAD) but indexes into smem tile.
+                        // You need tile-local coordinates here.
+                        int toeplitz_idx = ((warp_idx + pad_y + k_off_y) * neuron_i_smem_x_dim * Ni) + ((pad_x + k_off_x) * Ni) + (j * 16); //TODO: Padding
+                        wmma::load_matrix_sync(toeplitz_frag, neuron_i_smem + toeplitz_idx, Ni);  // FIX: was &neuron_i_smem
+
+                        // load filter from smem into registers
+                        // FIX: removed k_col * Nn * Ni — each smem buf is one [k_row][k_col] slice, no k_col dimension
+                        int filter_idx = j * 16;
+                        wmma::load_matrix_sync(filter_frag, active_synapse_smem_buf + filter_idx, Ni);  // FIX: was active_synapse_row_smem_buf
+
+                        // dispatch wmma
+                        wmma::mma_sync(c_frag, toeplitz_frag, filter_frag, c_frag);
+                    }
+                
+
+                __syncthreads();
+
+                if (has_next){
+                    idle_synapse_smem_buf = (active_buf_idx == 0) ? synapse_smem_buf2 : synapse_smem_buf1;
+                    load_synapse_xy_from_local(idle_synapse_smem_buf, synapse_reg_buf, next_k_row, next_k_col, t_idx, blockDim.x, Ni, Nn, kx_dim, ky_dim);
+                }
+                __syncthreads();
+                
+                active_buf_idx ^= 1;
+                
             }
 
-            __syncthreads();
-
-            if (has_next){
-                idle_synapse_smem_buf = (active_buf_idx == 0) ? synapse_smem_buf2 : synapse_smem_buf1;
-                load_synapse_xy_from_local(idle_synapse_smem_buf, synapse_reg_buf, next_k_row, next_k_col, t_idx, blockDim.x, Ni, Nn, kx_dim, ky_dim);
-            }
-            __syncthreads();
-            
-            active_buf_idx ^= 1;
-            
         }
 
-        // gather wmma
-        int out_idx = (batch_idx * NYSCL * NXSCL * Nn) + (y_out * NXSCL * Nn) + (x_out * Nn);
-        wmma::store_matrix_sync(neuron_n + out_idx, c_frag, Nn, wmma::mem_row_major);  // FIX: was neuron_n (no offset)
+        // write 16 output channels to global memory
+        // int out_idx = (batch_idx * NYSCL * NXSCL * Nn) + ((y_out + warp_idx) * NXSCL * Nn) + (x_out * Nn) + (i * 16);
+        // wmma::store_matrix_sync(neuron_n + out_idx, c_frag, Nn, wmma::mem_row_major);  // FIX: was neuron_n (no offset)
 
-        // DESIGN TODO: store is inside k_row loop — this stores partial results.
-        // The accumulator should finish ALL k_row * k_col iterations before storing.
+        // store to epilogue smem 
+        int epilogue_smem_idx = (warp_idx * 16 * Nn) + (i * 16);
+        wmma::store_matrix_sync(&epilogue_smem[epilogue_smem_idx], c_frag, Nn, wmma::mem_row_major);
+        __syncthreads();
+        
+    }
 
-        // write output tile to global memory
+    // epilogue sent to global memory 
+    for (int step = 0; step < 8 * 16 * Nn / (4 * blockDim.x); step++) {
+        int float4_vector_idx = (step * blockDim.x) + t_idx;
+        int smem_idx = float4_vector_idx * 4;
+        int smem_pixel = smem_idx / Nn;
+
+        int local_y = smem_pixel / 16;
+        int global_y = y_out + local_y;
+
+        int local_x = smem_pixel % 16;
+        int global_x = x_out + local_x;
+
+        int col = smem_idx % Nn;
+
+        int global_idx = (batch_idx * NYSCL * NXSCL * Nn) + (global_y * NXSCL * Nn) + (global_x * Nn) + col;
+
+        int padded_smem_idx = smem_pixel * padded_Nn + col;
+        float4 out_vec = *(float4*)(&epilogue_smem[padded_smem_idx]);
+        *(float4*)(&neuron_n[global_idx]) = out_vec;
     }
 }
 
@@ -264,7 +281,7 @@ void launch_convolution_layer(
     cudaFree(neuron_i_device_float);
     
     // TODO: Calculate block and grid dimensions
-    dim3 blockDim(128);
+    dim3 blockDim(256);
     dim3 gridDim(B, NYSCL / 8, NXSCL / 16);
 
     // TODO: Launch the kernel
