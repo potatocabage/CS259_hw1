@@ -1,6 +1,7 @@
 #include <cuda_runtime.h>
 #include <mma.h>
 #include "timing.h"
+#include <cuda_fp16.h>
 
 // Convolution parameters
 #define KY  3   /* kernel height */
@@ -8,12 +9,20 @@
 #define SY  1   /* stride y      */
 #define SX  1   /* stride x      */
 
+
+__global__ void float2half_kernel(const float * in, half * out, int size){
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    for (; idx < size; idx += blockDim.x * gridDim.x){
+        out[idx] = __float2half(in[idx]);
+    }
+}
+
 /* ------------------------------------------------------------------ */
 /* CUDA kernel for convolution                                        */
 /* ------------------------------------------------------------------ */
 __global__ void convolution_kernel(
-    float *synapse,    /* [KY * KX * Nn * Ni]         */
-    float *neuron_i,   /* [B * NYPAD * NXPAD * Ni]    */
+    half *synapse,    /* [KY * KX * Nn * Ni]         */
+    half *neuron_i,   /* [B * NYPAD * NXPAD * Ni]    */
     float *neuron_n,   /* [B * NYSCL * NXSCL * Nn]    */
     int B, int NYPAD, int NXPAD, int NYSCL, int NXSCL, int Ni, int Nn, int KY, int KX)
 {
@@ -30,17 +39,21 @@ __global__ void convolution_kernel(
     int pad_y = (KY - 1) / 2;
     int pad_x = (KX - 1) / 2;
     
-    __shared__ float neuron_i_smem[1 * 10 * 18 * 64];
-    __shared__ float synapse_row_smem_buf1[1 * 3 * 64 * 64];
-    __shared__ float synapse_row_smem_buf2[1 * 3 * 64 * 64];
-    __shared__ float *active_synapse_row_smem_buf = &synapse_row_smem_buf1;
-    __shared__ float *idle_synapse_row_smem_buf = &synapse_row_smem_buf2;
+    __shared__ half neuron_i_smem[1 * 10 * 18 * 64];
+    __shared__ half synapse_smem_buf1[1 * 64 * 64];
+    __shared__ half synapse_smem_buf2[1 * 64 * 64];
+    half synapse_reg_buf[1 * 64 * 64];
+    
+    __shared__ half *active_synapse_smem_buf = &synapse_smem_buf1;
+    __shared__ half *idle_synapse_smem_buf = &synapse_smem_buf2;
+    int active_buf_idx = 0;
     
     // load neuron_i tile (1x10x18x64) into smem
     load_neuron_i_tile(neuron_i_smem, neuron_i, t_idx, batch_idx, y_out, x_out, Ni, blockDim.x, NYPAD, NXPAD);
     
-    // load synapse[0] (1x3x64x64) into smem
-    load_synapse_row_tile(active_synapse_row_smem_buf, synapse, 0, t_idx, blockDim.x, Ni, Nn, KX);
+    // load synapse[0,0] (1x1x64x64) into smem
+    load_synapse_xy_from_global(active_synapse_smem_buf, synapse, 0, 0, t_idx, blockDim.x, Ni, Nn, KX, KY);
+    __syncthreads();
 
     // make wmma fragments
     wmmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> toeplitz_frag;
@@ -49,8 +62,20 @@ __global__ void convolution_kernel(
     wmma::fill_fragment(c_frag, 0.0f);
 
     for (int k_row = 0; k_row < 3; k_row ++){
+        for (int k_col = 0; k_col < KX ; k_col ++){
+            int next_k_row = k_row;
+            int next_k_col = k_col + 1;
+            if (next_k_col >= KX){
+                next_k_row = k_row + 1;
+                next_k_col = 0;
+            }
+            bool has_next = (next_k_row < KY);
 
-        for (int k_col = 0; k_col < KX ; k_col++){
+            if (has_next){
+                load_synapse_xy(synapse_reg_buf, synapse, next_k_row, next_k_col, t_idx, blockDim.x, Ni, Nn, KX, KY);
+            }
+            active_synapse_smem_buf = (active_buf_idx == 0) ? synapse_smem_buf1 : synapse_smem_buf2;
+            
             for (int i = 0; i < Nn / 16; i ++){
                 for(int j = 0; j < Ni / 16; j++){
 
@@ -70,19 +95,19 @@ __global__ void convolution_kernel(
                     wmma::mma_sync(c_frag, toeplitz_frag, filter_frag, c_frag);
                 }
             }
+
+            __syncthreads();
+
+            if (has_next){
+                idle_synapse_smem_buf = (active_buf_idx == 0) ? synapse_smem_buf2 : synapse_smem_buf1;
+                load_synapse_xy_from_local(idle_synapse_smem_buf, synapse_reg_buf, next_k_row, next_k_col, t_idx, blockDim.x, Ni, Nn, KX, KY);
+            }
+            __syncthreads();
+            
+            active_buf_idx ^= 1;
             
         }
 
-        // load synapse[k_row] (1x3x64x64) into smem
-        load_synapse_row_tile(idle_synapse_row_smem_buf, synapse, k_row, t_idx, blockDim.x, Ni, Nn, KX);
-        if (k_row + 1 % 2 == 1){
-            active_synapse_row_smem_buf = synapse_row_smem_buf2;
-            idle_synapse_row_smem_buf = synapse_row_smem_buf1;
-        } else {
-            active_synapse_row_smem_buf = synapse_row_smem_buf1;
-            idle_synapse_row_smem_buf = synapse_row_smem_buf2;
-        } 
-        
         // gather wmma
         int out_idx = (batch_idx * NYSCL * NXSCL * Nn) + (y_out * NXSCL * Nn) + (x_out * Nn);
         wmma::store_matrix_sync(neuron_n, c_frag, Nn, wmma::mem_row_major);
@@ -108,6 +133,36 @@ __device__ void load_neuron_i_tile(
     }
     __syncthreads();
 }
+
+__device__ void load_synapse_xy_from_global(
+    float* synapse_reg_buf,
+    float* synapse_global,
+    int k_row, int k_col, int t_idx, int blockDim_x, 
+    int Ni, int Nn, int KX, int KY
+)
+{
+    int Nn_over_2 = (Nn+1)/2;
+    for (int k = 0; k < Nn_over_2; k++){
+        int local_idx = (k * blockDim_x) + t_idx;
+        int global_idx = (k_row * KX * Nn * Ni) + (k_col * Nn * Ni) + (k * blockDim_x) + t_idx;
+        synapse_reg_buf[local_idx] = synapse_global[global_idx];
+    }
+}
+
+__device__ void load_synapse_xy_from_local(
+    float* synapse_smem,
+    float* synapse_reg_buf,
+    int k_row, int k_col, int t_idx, int blockDim_x, 
+    int Ni, int Nn, int KX, int KY
+)
+{
+    int Nn_over_2 = (Nn+1)/2;
+    for (int k = 0; k < Nn_over_2; k++){
+        int local_idx = (k * blockDim_x) + t_idx;
+        synapse_smem[local_idx] = synapse_reg_buf[local_idx];
+    }
+}
+
 
 __device__ void load_synapse_row_tile(
     float* synapse_row_smem,
@@ -144,23 +199,43 @@ void launch_convolution_layer(
     size_t neuron_i_bytes = NYPAD * NXPAD * Ni * sizeof(half);
     size_t neuron_n_bytes = NYSCL * NXSCL * Ni * sizeof(half);
 
-    half *synapse_device, *neuron_i_device, *neuron_n_device;
+    half *synapse_device_half, *neuron_i_device_half;
+    float *synapse_device_float, *neuron_i_device_float;
+    float *neuron_n_device;
 
     // allocate mem
-    cudaMalloc((void**)&synapse_device, synapse_bytes);
-    cudaMalloc((void**)&neuron_i_device, neuron_i_bytes);
+    cudaMalloc((void**)&synapse_device_half, synapse_bytes);
+    cudaMalloc((void**)&neuron_i_device_half, neuron_i_bytes);
+    cudaMalloc((void**)&synapse_device_float, synapse_bytes);
+    cudaMalloc((void**)&neuron_i_device_float, neuron_i_bytes);
     cudaMalloc((void**)&neuron_n_device, neuron_n_bytes);
 
     // copy mem
-    cudaMemcpy(synapse_device, synapse, synapse_bytes, cudaMemcpyHostToDevice);
-    cudaMemcpy(neuron_i_device, neuron_i, neuron_i_bytes, cudaMemcpyHostToDevice);
+    cudaMemcpy(synapse_device_float, synapse, synapse_bytes, cudaMemcpyHostToDevice);
+    cudaMemcpy(neuron_i_device_float, neuron_i, neuron_i_bytes, cudaMemcpyHostToDevice);
+
+    // convert
+    int size[2] = {synapse_bytes/2, neuron_i_bytes/2};
+    int conversion_threads = 256;
+    for (int i = 0; i < 2; i++){
+        int conversion_blockDim = min((size[i] + conversion_threads - 1) / conversion_threads, 2048);
+        float2half_kernel<<<conversion_blockDim, conversion_threads>>>(
+            (i==0)? synapse_device_float:neuron_i_device_float, 
+            (i==0)? synapse_device_half:neuron_i_device_half, 
+            size[i]);
+    }
+    cudaDeviceSynchronize();
+    cudaFree(synapse_device_float);
+    cudaFree(neuron_i_device_float);
     
     // TODO: Calculate block and grid dimensions
     dim3 blockDim(128);
     dim3 gridDim(B, NYSCL / 8, NXSCL / 16);
 
     // TODO: Launch the kernel
-    convolution_kernel<<<gridDim, blockDim>>>(synapse, neuron_i, neuron_n, B, Ny, Nx, Ni, Nn);
+    convolution_kernel<<<gridDim, blockDim>>>(
+        synapse_device_half, neuron_i_device_half, neuron_n_device, 
+        B, Ny, Nx, Ni, Nn);
     // TODO: Synchronize and check for errors
     cudaDeviceSynchronize();
 
@@ -168,8 +243,8 @@ void launch_convolution_layer(
     cudaMemcpy(neuron_n, neuron_n_device, neuron_n_bytes, cudaMemcpyDeviceToHost);
     
     // free mem
-    cudaFree(synapse_device);
-    cudaFree(neuron_i_device);
+    cudaFree(synapse_device_half);
+    cudaFree(neuron_i_device_half);
     cudaFree(neuron_n_device);
     
 }
