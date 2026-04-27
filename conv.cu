@@ -65,63 +65,92 @@ __global__ void float2half_kernel(const float * in, half * out, int size){
     }
 }
 
+// Read compact [B][NYPAD][NXPAD][Ni] float, write into spatially padded
+// [B][NYPAD_pad][NXPAD_pad][Ni] half. Caller must pre-zero the destination.
+__global__ void float2half_pad_kernel(
+    const float *src, half *dst,
+    int B, int NYPAD, int NXPAD, int Ni,
+    int NYPAD_pad, int NXPAD_pad)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = B * NYPAD * NXPAD * Ni;
+    for (; idx < total; idx += blockDim.x * gridDim.x){
+        int ni  = idx % Ni;
+        int rem = idx / Ni;
+        int x   = rem % NXPAD;
+        int rem2 = rem / NXPAD;
+        int y   = rem2 % NYPAD;
+        int b   = rem2 / NYPAD;
+        int dst_idx = ((b * NYPAD_pad + y) * NXPAD_pad + x) * Ni + ni;
+        dst[dst_idx] = __float2half(src[idx]);
+    }
+}
+
 /* ------------------------------------------------------------------ */
 /* Device helper functions (moved above kernel for forward decl)      */
 /* ------------------------------------------------------------------ */
 
+template <int NI_CHUNK>
 __device__ void load_neuron_i_tile(
     half* neuron_i_smem,
     half* neuron_i_global,
     int t_idx,
-    int batch_idx, int y_out, int x_out, int Ni,
+    int batch_idx, int y_out, int x_out, int Ni, int ic_base,
     int blockDim_x, int NYPAD, int NXPAD
 )
 {
     const int tile_h = KY - 1 + 8;          // 10 for KY=3
     const int tile_w = KX - 1 + 16;         // 18 for KX=3
-    const int total  = tile_h * tile_w * Ni;
+    const int total  = tile_h * tile_w * NI_CHUNK;
     for (int idx = t_idx; idx < total; idx += blockDim_x) {
-        int ni  = idx % Ni;
-        int rem = idx / Ni;
+        int ni  = idx % NI_CHUNK;
+        int rem = idx / NI_CHUNK;
         int tx  = rem % tile_w;
         int ty  = rem / tile_w;
         int gidx = (batch_idx * NYPAD * NXPAD * Ni)
                  + ((y_out + ty) * NXPAD * Ni)
                  + ((x_out + tx) * Ni)
-                 + ni;
+                 + ic_base + ni;
         neuron_i_smem[idx] = neuron_i_global[gidx];
     }
     __syncthreads();
 }
 
+template <int NI_CHUNK>
 __device__ void load_synapse_xy_from_global(
-    half* synapse_reg_buf,     // FIX: was float*
-    half* synapse_global,      // FIX: was float*
-    int k_row, int k_col, int Nn_idx, int t_idx, int blockDim_x, 
+    half* synapse_reg_buf,
+    half* synapse_global,
+    int k_row, int k_col, int Nn_idx, int ic_base, int t_idx, int blockDim_x,
     int Ni, int Nn, int kx_dim, int ky_dim
 )
 {
-    // Handle 16 output channels at a time. Synapse layout: [KY][KX][Nn][Ni].
-    int elements_per_thread = (16 * Ni) / blockDim_x;
-    int base = (k_row * kx_dim * Nn * Ni) + (k_col * Nn * Ni) + (Nn_idx * 16 * Ni);
+    // Stage a [16][NI_CHUNK] slice of synapse[KY][KX][Nn][Ni] starting at
+    // (k_row, k_col, Nn_idx*16, ic_base) into per-thread regs.
+    int elements_per_thread = (16 * NI_CHUNK) / blockDim_x;
     for (int k = 0; k < elements_per_thread; k++){
-        int global_flat = base + k * blockDim_x + t_idx;
+        int linear   = k * blockDim_x + t_idx;
+        int n_local  = linear / NI_CHUNK;
+        int ic_local = linear % NI_CHUNK;
+        int global_flat = ((k_row * kx_dim + k_col) * Nn + Nn_idx * 16 + n_local) * Ni
+                        + ic_base + ic_local;
         synapse_reg_buf[k] = synapse_global[global_flat];
     }
 }
 
+template <int NI_CHUNK>
 __device__ void load_synapse_xy_from_local(
-    half* synapse_smem,        // FIX: was float*
-    half* synapse_reg_buf,     // FIX: was float*
-    int k_row, int k_col, int t_idx, int blockDim_x, 
+    half* synapse_smem,
+    half* synapse_reg_buf,
+    int k_row, int k_col, int t_idx, int blockDim_x,
     int Ni, int Nn, int kx_dim, int ky_dim
 )
 {
-    // Should only handle 16 output channels at a time
-    int elements_per_thread = (16 * Ni) / blockDim_x;  // FIX: was Nn_over_2
+    // Smem layout: [16][NI_CHUNK] row-major. Linear index matches the
+    // (n_local, ic_local) decomposition used by the global load above.
+    int elements_per_thread = (16 * NI_CHUNK) / blockDim_x;
     for (int k = 0; k < elements_per_thread; k++){
         int smem_flat = k * blockDim_x + t_idx;
-        synapse_smem[smem_flat] = synapse_reg_buf[k];  // FIX: read [k], write interleaved
+        synapse_smem[smem_flat] = synapse_reg_buf[k];
     }
 }
 
@@ -129,100 +158,102 @@ __device__ void load_synapse_xy_from_local(
 /* ------------------------------------------------------------------ */
 /* CUDA kernel for convolution                                        */
 /* ------------------------------------------------------------------ */
+template <int NI_CHUNK>
 __global__ void convolution_kernel(
     half *synapse,    /* [KY * KX * Nn * Ni]         */
     half *neuron_i,   /* [B * NYPAD * NXPAD * Ni]    */
     float *neuron_n,   /* [B * NYSCL * NXSCL * Nn]    */
     int B, int NYPAD, int NXPAD, int NYSCL, int NXSCL, int Ni, int Nn, int ky_dim, int kx_dim)
 {
-    // Grid Dim is (B, NYSCL / 8, NXSCL / 16)
+    // Grid Dim is (B, NYSCL / 8, NXSCL / 16); spatial dims are pre-padded by the launcher.
     // Block Dim is (256, 1, 1)
-    // each block does a 1x8x16x64 tile in output
-    // each warp does a 1x1x16x64 tile in output
+    // each block does a 1x8x16xNn tile in output
+    // each warp does a 1x1x16xNn tile in output
     int t_idx = threadIdx.x; //0 to 255
     int warp_idx = t_idx / 32; // 0 to 7
-    
+
     int batch_idx = blockIdx.x;
     int y_out = blockIdx.y * 8;
     int x_out = blockIdx.z * 16;
-    
+
     int pad_y = (ky_dim - 1) / 2;
     int pad_x = (kx_dim - 1) / 2;
 
-    // Hardcoded for Conv1 (Ni=Nn=64, KX=KY=3); comments give parametric form for templating.
-    __shared__ half  neuron_i_smem[10 * 18 * 64];   // (8 + KY-1) * (16 + KX-1) * Ni
-    __shared__ half  synapse_smem_buf1[16 * 64];    // 16-channel block * Ni
-    __shared__ half  synapse_smem_buf2[16 * 64];    // 16-channel block * Ni
-    __shared__ float epilogue_smem[8 * 16 * 16];    // 8 warps * 16 output cols * 16-channel block
-    half             synapse_reg_buf[4];            // (16-channel block * Ni) / blockDim.x
+    __shared__ half  neuron_i_smem[10 * 18 * NI_CHUNK];  // (8 + KY-1) * (16 + KX-1) * NI_CHUNK
+    __shared__ half  synapse_smem_buf1[16 * NI_CHUNK];   // 16-channel block * NI_CHUNK
+    __shared__ half  synapse_smem_buf2[16 * NI_CHUNK];   // 16-channel block * NI_CHUNK
+    __shared__ float epilogue_smem[8 * 16 * 16];         // 8 warps * 16 output cols * 16-channel block
+    half             synapse_reg_buf[(16 * NI_CHUNK) / 256];   // (16-channel block * NI_CHUNK) / blockDim.x
 
     half *active_synapse_smem_buf = synapse_smem_buf1;
     half *idle_synapse_smem_buf   = synapse_smem_buf2;
     int   active_buf_idx          = 0;
-    
-    // load neuron_i tile (1x10x18xNi) into smem
-    load_neuron_i_tile(neuron_i_smem, neuron_i, t_idx, batch_idx, y_out, x_out, Ni, blockDim.x, NYPAD, NXPAD);
-    
-    
 
     // make wmma fragments
-    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> toeplitz_frag;   // FIX: was wmmma
-    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> filter_frag;     // FIX: was wmmma
-    wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag;                       // FIX: was wmmma
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> toeplitz_frag;
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> filter_frag;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag;
 
     for (int i = 0; i < Nn / 16; i ++){
-        // Reset double-buffer state for this 16-channel block: line up the initial
-        // (0,0) load with what the first inner iteration will read.
-        active_buf_idx          = 0;
-        active_synapse_smem_buf = synapse_smem_buf1;
-        idle_synapse_smem_buf   = synapse_smem_buf2;
-
-        // load synapse[0,0] (1x1x16xNi) into regs, then copy to smem with correct layout
-        load_synapse_xy_from_global(synapse_reg_buf, synapse, 0, 0, i, t_idx, blockDim.x, Ni, Nn, kx_dim, ky_dim);
-        load_synapse_xy_from_local(active_synapse_smem_buf, synapse_reg_buf, 0, 0, t_idx, blockDim.x, Ni, Nn, kx_dim, ky_dim);
-        __syncthreads();
-
+        // c_frag accumulates partial sums across input-channel chunks.
         wmma::fill_fragment(c_frag, 0.0f);
-        for (int k_row = 0; k_row < ky_dim; k_row ++){
-            for (int k_col = 0; k_col < kx_dim ; k_col ++){
-                int next_k_row = k_row;
-                int next_k_col = k_col + 1;
-                if (next_k_col >= kx_dim){
-                    next_k_row = k_row + 1;
-                    next_k_col = 0;
+
+        for (int ic_base = 0; ic_base < Ni; ic_base += NI_CHUNK){
+            // load neuron_i tile (1x10x18xNI_CHUNK) into smem for this chunk
+            load_neuron_i_tile<NI_CHUNK>(neuron_i_smem, neuron_i, t_idx, batch_idx, y_out, x_out, Ni, ic_base, blockDim.x, NYPAD, NXPAD);
+
+            // Reset double-buffer state for this (i, ic_base) pair: line up the
+            // initial (0,0) load with what the first inner iteration will read.
+            active_buf_idx          = 0;
+            active_synapse_smem_buf = synapse_smem_buf1;
+            idle_synapse_smem_buf   = synapse_smem_buf2;
+
+            // load synapse[0,0] (1x1x16xNI_CHUNK) into regs, then copy to smem with correct layout
+            load_synapse_xy_from_global<NI_CHUNK>(synapse_reg_buf, synapse, 0, 0, i, ic_base, t_idx, blockDim.x, Ni, Nn, kx_dim, ky_dim);
+            load_synapse_xy_from_local<NI_CHUNK>(active_synapse_smem_buf, synapse_reg_buf, 0, 0, t_idx, blockDim.x, Ni, Nn, kx_dim, ky_dim);
+            __syncthreads();
+
+            for (int k_row = 0; k_row < ky_dim; k_row ++){
+                for (int k_col = 0; k_col < kx_dim ; k_col ++){
+                    int next_k_row = k_row;
+                    int next_k_col = k_col + 1;
+                    if (next_k_col >= kx_dim){
+                        next_k_row = k_row + 1;
+                        next_k_col = 0;
+                    }
+                    bool has_next = (next_k_row < ky_dim);
+
+                    if (has_next){
+                        load_synapse_xy_from_global<NI_CHUNK>(synapse_reg_buf, synapse, next_k_row, next_k_col, i, ic_base, t_idx, blockDim.x, Ni, Nn, kx_dim, ky_dim);
+                    }
+                    active_synapse_smem_buf = (active_buf_idx == 0) ? synapse_smem_buf1 : synapse_smem_buf2;
+
+                    for(int j = 0; j < NI_CHUNK / 16; j++){
+
+                        // load toeplitz from smem into registers (smem tile stride = 18 * NI_CHUNK)
+                        int k_off_y = k_row - ky_dim / 2;
+                        int k_off_x = k_col - kx_dim / 2;
+                        int toeplitz_idx = ((warp_idx + pad_y + k_off_y) * 18 * NI_CHUNK) + ((pad_x + k_off_x) * NI_CHUNK) + (j * 16);
+                        wmma::load_matrix_sync(toeplitz_frag, neuron_i_smem + toeplitz_idx, NI_CHUNK);
+
+                        // load filter from smem into registers
+                        int filter_idx = j * 16;
+                        wmma::load_matrix_sync(filter_frag, active_synapse_smem_buf + filter_idx, NI_CHUNK);
+
+                        // dispatch wmma
+                        wmma::mma_sync(c_frag, toeplitz_frag, filter_frag, c_frag);
+                    }
+
+                    __syncthreads();
+
+                    if (has_next){
+                        idle_synapse_smem_buf = (active_buf_idx == 0) ? synapse_smem_buf2 : synapse_smem_buf1;
+                        load_synapse_xy_from_local<NI_CHUNK>(idle_synapse_smem_buf, synapse_reg_buf, next_k_row, next_k_col, t_idx, blockDim.x, Ni, Nn, kx_dim, ky_dim);
+                    }
+                    __syncthreads();
+
+                    active_buf_idx ^= 1;
                 }
-                bool has_next = (next_k_row < ky_dim);
-
-                if (has_next){
-                    load_synapse_xy_from_global(synapse_reg_buf, synapse, next_k_row, next_k_col, i, t_idx, blockDim.x, Ni, Nn, kx_dim, ky_dim);
-                }
-                active_synapse_smem_buf = (active_buf_idx == 0) ? synapse_smem_buf1 : synapse_smem_buf2;
-
-                for(int j = 0; j < Ni / 16; j++){
-
-                    // load toeplitz from smem into registers (smem tile stride = 18 * Ni; KX-1+16 = 18 for KX=3)
-                    int k_off_y = k_row - ky_dim / 2;
-                    int k_off_x = k_col - kx_dim / 2;
-                    int toeplitz_idx = ((warp_idx + pad_y + k_off_y) * 18 * Ni) + ((pad_x + k_off_x) * Ni) + (j * 16);
-                    wmma::load_matrix_sync(toeplitz_frag, neuron_i_smem + toeplitz_idx, Ni);
-
-                    // load filter from smem into registers
-                    int filter_idx = j * 16;
-                    wmma::load_matrix_sync(filter_frag, active_synapse_smem_buf + filter_idx, Ni);
-
-                    // dispatch wmma
-                    wmma::mma_sync(c_frag, toeplitz_frag, filter_frag, c_frag);
-                }
-
-                __syncthreads();
-
-                if (has_next){
-                    idle_synapse_smem_buf = (active_buf_idx == 0) ? synapse_smem_buf2 : synapse_smem_buf1;
-                    load_synapse_xy_from_local(idle_synapse_smem_buf, synapse_reg_buf, next_k_row, next_k_col, t_idx, blockDim.x, Ni, Nn, kx_dim, ky_dim);
-                }
-                __syncthreads();
-
-                active_buf_idx ^= 1;
             }
         }
 
@@ -270,16 +301,23 @@ void launch_convolution_layer(
     int NXPAD = Nx + KX - 1,  NYPAD = Ny + KY - 1;
     int NXSCL = (Nx + SX - 1) / SX,  NYSCL = (Ny + SY - 1) / SY;
 
-    // FIX: compute element counts first, derive byte sizes from them
-    long long syn_elems = (long long)KY * KX * Nn * Ni;
-    long long inp_elems = (long long)B * NYPAD * NXPAD * Ni;    // FIX: was missing B
-    long long out_elems = (long long)B * NYSCL * NXSCL * Nn;    // FIX: was Ni, missing B, was sizeof(half)
+    // Pad output spatial to block tile (8, 16); input grows by (KY-1, KX-1).
+    // For Conv1 (224×224) these are no-ops; for Conv2 (14×14) we round up to 16×16.
+    int NYSCL_pad = ((NYSCL + 7) / 8) * 8;
+    int NXSCL_pad = ((NXSCL + 15) / 16) * 16;
+    int NYPAD_pad = NYSCL_pad + KY - 1;
+    int NXPAD_pad = NXSCL_pad + KX - 1;
 
-    size_t synapse_half_bytes  = syn_elems * sizeof(half);
-    size_t neuron_i_half_bytes = inp_elems * sizeof(half);
-    size_t synapse_float_bytes  = syn_elems * sizeof(float);
-    size_t neuron_i_float_bytes = inp_elems * sizeof(float);
-    size_t neuron_n_bytes = out_elems * sizeof(float);           // FIX: output is float, not half
+    long long syn_elems     = (long long)KY * KX * Nn * Ni;
+    long long inp_elems     = (long long)B * NYPAD * NXPAD * Ni;
+    long long inp_elems_pad = (long long)B * NYPAD_pad * NXPAD_pad * Ni;
+    long long out_elems_pad = (long long)B * NYSCL_pad * NXSCL_pad * Nn;
+
+    size_t synapse_half_bytes      = syn_elems * sizeof(half);
+    size_t neuron_i_half_pad_bytes = inp_elems_pad * sizeof(half);
+    size_t synapse_float_bytes     = syn_elems * sizeof(float);
+    size_t neuron_i_float_bytes    = inp_elems * sizeof(float);
+    size_t neuron_n_pad_bytes      = out_elems_pad * sizeof(float);
 
     half *synapse_device_half, *neuron_i_device_half;
     float *synapse_device_float, *neuron_i_device_float;
@@ -287,14 +325,17 @@ void launch_convolution_layer(
 
     // allocate mem
     cudaMalloc((void**)&synapse_device_half, synapse_half_bytes);
-    cudaMalloc((void**)&neuron_i_device_half, neuron_i_half_bytes);
-    cudaMalloc((void**)&synapse_device_float, synapse_float_bytes);   // FIX: was half-sized
-    cudaMalloc((void**)&neuron_i_device_float, neuron_i_float_bytes); // FIX: was half-sized
-    cudaMalloc((void**)&neuron_n_device, neuron_n_bytes);
+    cudaMalloc((void**)&neuron_i_device_half, neuron_i_half_pad_bytes);
+    cudaMalloc((void**)&synapse_device_float, synapse_float_bytes);
+    cudaMalloc((void**)&neuron_i_device_float, neuron_i_float_bytes);
+    cudaMalloc((void**)&neuron_n_device, neuron_n_pad_bytes);
 
-    // copy mem (float-sized)
-    cudaMemcpy(synapse_device_float, synapse, synapse_float_bytes, cudaMemcpyHostToDevice);     // FIX: was half-sized
-    cudaMemcpy(neuron_i_device_float, neuron_i, neuron_i_float_bytes, cudaMemcpyHostToDevice);  // FIX: was half-sized
+    // zero the padded half input — values outside the unpadded region stay 0.
+    cudaMemset(neuron_i_device_half, 0, neuron_i_half_pad_bytes);
+
+    // copy mem (float-sized, compact)
+    cudaMemcpy(synapse_device_float, synapse, synapse_float_bytes, cudaMemcpyHostToDevice);
+    cudaMemcpy(neuron_i_device_float, neuron_i, neuron_i_float_bytes, cudaMemcpyHostToDevice);
 
     // convert float -> half
     int conversion_threads = 256;
@@ -305,36 +346,45 @@ void launch_convolution_layer(
             synapse_device_float, synapse_device_half, n);
     }
     {
+        // Pad-aware conversion: read compact float, write into padded half.
         int n = (int)inp_elems;
         int blocks = min((n + conversion_threads - 1) / conversion_threads, 2048);
-        float2half_kernel<<<blocks, conversion_threads>>>(
-            neuron_i_device_float, neuron_i_device_half, n);
+        float2half_pad_kernel<<<blocks, conversion_threads>>>(
+            neuron_i_device_float, neuron_i_device_half,
+            B, NYPAD, NXPAD, Ni, NYPAD_pad, NXPAD_pad);
     }
     cudaDeviceSynchronize();
     cudaFree(synapse_device_float);
     cudaFree(neuron_i_device_float);
-    
-    // TODO: Calculate block and grid dimensions
-    dim3 blockDim(256);
-    dim3 gridDim(B, NYSCL / 8, NXSCL / 16);
 
-    // TODO: Launch the kernel
-    convolution_kernel<<<gridDim, blockDim>>>(
+    dim3 blockDim(256);
+    dim3 gridDim(B, NYSCL_pad / 8, NXSCL_pad / 16);
+
+    convolution_kernel<64><<<gridDim, blockDim>>>(
         synapse_device_half, neuron_i_device_half, neuron_n_device,
-        B, NYPAD, NXPAD, NYSCL, NXSCL, Ni, Nn, KY, KX);
+        B, NYPAD_pad, NXPAD_pad, NYSCL_pad, NXSCL_pad, Ni, Nn, KY, KX);
     cudaDeviceSynchronize();
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess)
         fprintf(stderr, "convolution_kernel error: %s\n", cudaGetErrorString(err));
 
-    // read answer
-    cudaMemcpy(neuron_n, neuron_n_device, neuron_n_bytes, cudaMemcpyDeviceToHost);
-    
+    // Copy back the valid [NYSCL][NXSCL] region of each batch from the padded output.
+    for (int b = 0; b < B; b++) {
+        cudaMemcpy2D(
+            &neuron_n[(long long)b * NYSCL * NXSCL * Nn],
+            (size_t)NXSCL * Nn * sizeof(float),
+            &neuron_n_device[(long long)b * NYSCL_pad * NXSCL_pad * Nn],
+            (size_t)NXSCL_pad * Nn * sizeof(float),
+            (size_t)NXSCL * Nn * sizeof(float),
+            NYSCL,
+            cudaMemcpyDeviceToHost);
+    }
+
     // free mem
     cudaFree(synapse_device_half);
     cudaFree(neuron_i_device_half);
     cudaFree(neuron_n_device);
-    
+
 }
 
 
@@ -388,6 +438,8 @@ int main(void)
     /*        name         B    Ny   Nx   Ni   Nn  */
     run("Conv1-VGG",  1,  224, 224,  64,  64);
     run("Conv1-VGG", 16,  224, 224,  64,  64);
+    run("Conv2-VGG",  1,   14,  14, 512, 512);
+    run("Conv2-VGG", 16,   14,  14, 512, 512);
 
     printf("\n");
     return 0;
