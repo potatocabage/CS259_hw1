@@ -1,1 +1,9 @@
 conv_cuda
+attention
+conv
+ncu_*.csv
+*.ncu-rep
+conv_cuda_no_db
+conv_cuda_opt
+conv_no_db
+conv_opt
